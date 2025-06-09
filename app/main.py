@@ -1,331 +1,619 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
-import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-import uvicorn
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pickle
+import requests
+import json
+from collections import defaultdict
 import os
-import joblib  # Thêm thư viện để lưu/load model
-from datetime import datetime
-
-# Khởi tạo FastAPI app
-app = FastAPI(
-    title="Student Dropout Risk Prediction API",
-    description="API để dự đoán nguy cơ bỏ học của sinh viên",
-    version="1.0.0"
-)
-
-# Cấu hình CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001"
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
+import uvicorn
+from contextlib import asynccontextmanager
 
 
-# Models cho request/response
-class Student(BaseModel):
-    email: str
-    name: str
-    days_since_enrollment: int
-    passedLesson: int
-    passedTests: int
-    progress: float
-    lastLogin: str
+# ===============================
+# PYDANTIC MODELS
+# ===============================
+
+class CourseRecommendation(BaseModel):
+    course_id: int
+    course_name: str
+    category: str
+    difficulty: str
+    duration_hours: int
+    rating: float
+    num_lessons: int
+    ai_score: float
 
 
-class StudentWithRisk(BaseModel):
-    email: str
-    name: str
-    days_since_enrollment: int
-    passedLesson: int
-    passedTests: int
-    progress: float
-    lastLogin: str
-    risk: int
-    risk_status: str
+class UserProfile(BaseModel):
+    user_id: str
+    age: Optional[int] = None
+    current_level: Optional[int] = None
+    learning_goal: Optional[str] = None
+    study_time_per_week: Optional[int] = None
+    preferred_skill: Optional[str] = None
+    country: Optional[str] = None
 
 
-class PredictionRequest(BaseModel):
-    students: List[Student]
+class RecommendationResponse(BaseModel):
+    user_id: str
+    user_profile: UserProfile
+    recommendations: List[CourseRecommendation]
+    total_courses: int
 
 
-class PredictionResponse(BaseModel):
-    predictions: List[StudentWithRisk]
-    summary: dict
+# ===============================
+# MODEL ARCHITECTURE (Same as training)
+# ===============================
+
+class DQNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(DQNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.LayerNorm(hidden_dim)
+        self.dropout1 = nn.Dropout(0.3)
+
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.LayerNorm(hidden_dim)
+        self.dropout2 = nn.Dropout(0.3)
+
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = self.dropout1(x)
+        x = F.relu(self.bn2(self.fc2(x)))
+        x = self.dropout2(x)
+        return self.fc3(x)
 
 
-# Global model variable
-model = None
-MODEL_FILE = 'student_dropout_model.pkl'  # File để lưu model
-TRAINING_DATA_FILE = 'student_training_data.csv'
+class DQNAgent:
+    def __init__(self, state_dim, action_dim, hidden_dim, learning_rate, gamma,
+                 epsilon_start, epsilon_end, epsilon_decay):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.q_network = DQNetwork(state_dim, hidden_dim, action_dim).to(self.device)
+        self.q_network.eval()  # Set to evaluation mode
 
-
-def train_and_save_model():
-    """Train model từ CSV và lưu vào file"""
-    try:
-        # Kiểm tra file CSV có tồn tại không
-        if not os.path.exists(TRAINING_DATA_FILE):
-            raise FileNotFoundError(f"Không tìm thấy file {TRAINING_DATA_FILE}")
-
-        # Đọc dữ liệu từ CSV
-        print(f"Đang đọc dữ liệu từ {TRAINING_DATA_FILE}...")
-        df = pd.read_csv(TRAINING_DATA_FILE)
-
-        # Kiểm tra các cột cần thiết
-        required_columns = ['days_since_enrollment', 'passedLesson', 'passedTests', 'progress', 'risk']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-
-        if missing_columns:
-            raise ValueError(f"Thiếu các cột: {missing_columns}")
-
-        # Tách features và labels
-        X_train = df[['days_since_enrollment', 'passedLesson', 'passedTests', 'progress']].values
-        y_train = df['risk'].values
-
-        print(f"Đã load {len(df)} mẫu dữ liệu training")
-        print(f"Số lượng sinh viên có nguy cơ bỏ học: {sum(y_train)}")
-        print(f"Số lượng sinh viên an toàn: {len(y_train) - sum(y_train)}")
-
-        # Train model
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
-
-        # Lưu model vào file
-        joblib.dump(model, MODEL_FILE)
-        print(f"✓ Model đã được train và lưu vào {MODEL_FILE}")
-
-        # Lưu thông tin metadata
-        metadata = {
-            'trained_at': datetime.now().isoformat(),
-            'training_samples': len(df),
-            'high_risk_count': int(sum(y_train)),
-            'safe_count': int(len(y_train) - sum(y_train))
-        }
-
-        import json
-        with open('model_metadata.json', 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-        return model
-
-    except Exception as e:
-        print(f"Lỗi khi train model: {e}")
-        raise e
-
-
-def load_saved_model():
-    """Load model đã lưu từ file"""
-    try:
-        if os.path.exists(MODEL_FILE):
-            model = joblib.load(MODEL_FILE)
-            print(f"✓ Đã load model từ {MODEL_FILE}")
-
-            # Hiển thị thông tin metadata nếu có
-            if os.path.exists('model_metadata.json'):
-                import json
-                with open('model_metadata.json', 'r', encoding='utf-8') as f:
-                    metadata = json.load(f)
-                print(f"  - Được train lúc: {metadata.get('trained_at', 'N/A')}")
-                print(f"  - Số mẫu training: {metadata.get('training_samples', 'N/A')}")
-                print(f"  - Sinh viên nguy cơ cao: {metadata.get('high_risk_count', 'N/A')}")
-                print(f"  - Sinh viên an toàn: {metadata.get('safe_count', 'N/A')}")
-
-            return model
+    def choose_action(self, state, epsilon=0.0):
+        """Choose action with optional exploration"""
+        if np.random.random() < epsilon:
+            return np.random.randint(0, self.action_dim)
         else:
-            print(f"Không tìm thấy file model {MODEL_FILE}")
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.q_network(state)
+            return torch.argmax(q_values).item()
+
+
+# ===============================
+# RECOMMENDATION SYSTEM CLASS
+# ===============================
+
+class EnglishLearningRecommendationSystem:
+    def __init__(self, model_path="complete_english_learning_model.pkl"):
+        """Initialize the recommendation system"""
+        self.model_path = model_path
+        self.agent = None
+        self.course_data = None
+        self.user_data = None
+        self.mappings = None
+        self.course_features = None
+        self.load_model()
+        self.setup_system()
+
+    def load_model(self):
+        """Load trained model and metadata"""
+        try:
+            with open(self.model_path, 'rb') as f:
+                model_data = pickle.load(f)
+
+            # Extract hyperparameters
+            hyperparams = model_data['hyperparameters']
+
+            # Recreate agent
+            self.agent = DQNAgent(
+                hyperparams['state_dim'],
+                hyperparams['action_dim'],
+                hyperparams['hidden_dim'],
+                hyperparams['learning_rate'],
+                hyperparams['gamma'],
+                1.0, 0.01, 0.995
+            )
+
+            # Load model weights
+            self.agent.q_network.load_state_dict(model_data['model_state_dict'])
+            self.mappings = model_data['mappings']
+
+            print("✅ Model loaded successfully!")
+
+        except FileNotFoundError:
+            print(f"❌ Model file not found: {self.model_path}")
+            raise
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            raise
+
+    def setup_system(self):
+        """Setup course and user data structures"""
+        print("🔄 Fetching course and user data...")
+
+        courses_data = self.fetch_courses_from_api()
+        users_data = self.fetch_users_from_api()
+
+        if courses_data is None or users_data is None:
+            print("⚠️  API unavailable, using sample data...")
+            courses_data, users_data = self.create_sample_data()
+
+        self.course_data = courses_data
+        self.user_data = users_data
+        self.course_features = self.create_course_features()
+
+        print(f"✅ System ready! {len(self.course_data)} courses, {len(self.user_data)} users")
+
+    def fetch_courses_from_api(self):
+        """Fetch courses from API"""
+        try:
+            url = "http://localhost:8001/api/v1/course-statistics/suggestions/get-courses"
+            response = requests.post(url, timeout=5)
+
+            if response.status_code == 200:
+                courses = response.json()
+                return self.process_courses_data(courses)
             return None
-    except Exception as e:
-        print(f"Lỗi khi load model: {e}")
-        return None
+        except:
+            return None
+
+    def fetch_users_from_api(self):
+        """Fetch users from API"""
+        try:
+            url = "http://localhost:8001/api/v1/course-statistics/suggestions/get-users"
+            response = requests.post(url, timeout=5)
+
+            if response.status_code == 200:
+                users = response.json()
+                return self.process_users_data(users)
+            return None
+        except:
+            return None
+
+    def process_courses_data(self, api_courses):
+        """Process API course data"""
+        course_categories = ['Grammar', 'Vocabulary', 'Speaking', 'Listening', 'Reading', 'Writing', 'TOEIC', 'IELTS']
+        difficulty_levels = ['Beginner', 'Elementary', 'Intermediate', 'Upper-Intermediate', 'Advanced']
+
+        courses = []
+        for course in api_courses:
+            course_info = {
+                'course_id': course['course_id'],
+                'course_name': f"Course_{course['course_id']}",
+                'category': np.random.choice(course_categories),
+                'difficulty': np.random.choice(difficulty_levels),
+                'duration_hours': np.random.randint(5, 50),
+                'rating': np.random.uniform(3.0, 5.0),
+                'num_lessons': np.random.randint(10, 100),
+                'prerequisite_level': np.random.randint(0, 5)
+            }
+            courses.append(course_info)
+
+        return pd.DataFrame(courses)
+
+    def process_users_data(self, api_users):
+        """Process API user data"""
+        course_categories = ['Grammar', 'Vocabulary', 'Speaking', 'Listening', 'Reading', 'Writing', 'TOEIC', 'IELTS']
+
+        users = []
+        for user in api_users:
+            user_info = {
+                'user_id': user['username'],
+                'age': np.random.randint(15, 60),
+                'current_level': np.random.randint(0, 5),
+                'learning_goal': np.random.choice(['Business', 'Academic', 'Travel', 'General', 'Test_Prep']),
+                'study_time_per_week': np.random.randint(2, 20),
+                'preferred_skill': np.random.choice(course_categories),
+                'country': np.random.choice(['Vietnam', 'Korea', 'Japan', 'China', 'Thailand', 'Other'])
+            }
+            users.append(user_info)
+
+        return pd.DataFrame(users)
+
+    def create_sample_data(self):
+        """Create sample data when API is unavailable"""
+        # Sample courses
+        course_categories = ['Grammar', 'Vocabulary', 'Speaking', 'Listening', 'Reading', 'Writing', 'TOEIC', 'IELTS']
+        difficulty_levels = ['Beginner', 'Elementary', 'Intermediate', 'Upper-Intermediate', 'Advanced']
+
+        courses = []
+        for i in range(1, 51):  # 50 sample courses
+            course = {
+                'course_id': i,
+                'course_name': f"English Course {i}",
+                'category': np.random.choice(course_categories),
+                'difficulty': np.random.choice(difficulty_levels),
+                'duration_hours': np.random.randint(5, 50),
+                'rating': np.random.uniform(3.0, 5.0),
+                'num_lessons': np.random.randint(10, 100),
+                'prerequisite_level': np.random.randint(0, 5)
+            }
+            courses.append(course)
+
+        # Sample users
+        users = []
+        for i in range(1, 21):  # 20 sample users
+            user = {
+                'user_id': f"user_{i}",
+                'age': np.random.randint(15, 60),
+                'current_level': np.random.randint(0, 5),
+                'learning_goal': np.random.choice(['Business', 'Academic', 'Travel', 'General', 'Test_Prep']),
+                'study_time_per_week': np.random.randint(2, 20),
+                'preferred_skill': np.random.choice(course_categories),
+                'country': np.random.choice(['Vietnam', 'Korea', 'Japan', 'China', 'Thailand', 'Other'])
+            }
+            users.append(user)
+
+        return pd.DataFrame(courses), pd.DataFrame(users)
+
+    def create_course_features(self):
+        """Create course feature vectors"""
+        num_categories = len(self.mappings['category_mapping'])
+        num_difficulties = 5
+
+        course_features = {}
+
+        for _, course in self.course_data.iterrows():
+            course_id = course['course_id']
+
+            # One-hot encode category
+            category_feature = np.zeros(num_categories)
+            if course['category'] in self.mappings['category_mapping']:
+                category_idx = self.mappings['category_mapping'][course['category']]
+                category_feature[category_idx] = 1
+
+            # One-hot encode difficulty
+            difficulty_feature = np.zeros(num_difficulties)
+            if course['difficulty'] in self.mappings['difficulty_mapping']:
+                difficulty_idx = self.mappings['difficulty_mapping'][course['difficulty']]
+                difficulty_feature[difficulty_idx] = 1
+
+            # Normalized numerical features
+            duration_norm = min(course['duration_hours'] / 50.0, 1.0)
+            rating_norm = course['rating'] / 5.0
+            lessons_norm = min(course['num_lessons'] / 100.0, 1.0)
+
+            # Combine features
+            feature_vector = np.concatenate([
+                category_feature,
+                difficulty_feature,
+                [duration_norm, rating_norm, lessons_norm]
+            ])
+
+            course_features[course_id] = feature_vector
+
+        return course_features
+
+    def encode_user_features(self, user_info):
+        """Encode user features"""
+        num_age_groups = 5
+        num_levels = 5
+        num_goals = len(self.mappings['goal_mapping'])
+        num_skills = len(self.mappings['skill_mapping'])
+
+        # Age groups
+        age = user_info.get('age', 25)
+        if age <= 20:
+            age_group = 0
+        elif age <= 30:
+            age_group = 1
+        elif age <= 40:
+            age_group = 2
+        elif age <= 50:
+            age_group = 3
+        else:
+            age_group = 4
+
+        age_feature = np.zeros(num_age_groups)
+        age_feature[age_group] = 1
+
+        # Level
+        level = user_info.get('current_level', 2)
+        level_feature = np.zeros(num_levels)
+        level_feature[min(level, num_levels - 1)] = 1
+
+        # Goal
+        goal_feature = np.zeros(num_goals)
+        goal = user_info.get('learning_goal', 'General')
+        if goal in self.mappings['goal_mapping']:
+            goal_idx = self.mappings['goal_mapping'][goal]
+            goal_feature[goal_idx] = 1
+
+        # Skill
+        skill_feature = np.zeros(num_skills)
+        skill = user_info.get('preferred_skill', 'Grammar')
+        if skill in self.mappings['skill_mapping']:
+            skill_idx = self.mappings['skill_mapping'][skill]
+            skill_feature[skill_idx] = 1
+
+        # Study time
+        study_time_norm = min(user_info.get('study_time_per_week', 10) / 20.0, 1.0)
+
+        # Combine features
+        user_feature = np.concatenate([
+            age_feature, level_feature, goal_feature, skill_feature, [study_time_norm]
+        ])
+
+        return user_feature
+
+    def encode_state(self, user_info, course_id):
+        """Combine user and course features into state"""
+        user_feature = self.encode_user_features(user_info)
+        course_feature = self.course_features.get(course_id, np.zeros(len(list(self.course_features.values())[0])))
+
+        state = np.concatenate([user_feature, course_feature])
+        return state
+
+    def recommend_courses(self, user_info, top_k=5, exclude_courses=None):
+        """Recommend top-k courses for a user"""
+        if exclude_courses is None:
+            exclude_courses = []
+
+        available_courses = [cid for cid in self.course_data['course_id']
+                             if cid not in exclude_courses]
+
+        if not available_courses:
+            return []
+
+        # Score all available courses
+        course_scores = []
+
+        for course_id in available_courses:
+            state = self.encode_state(user_info, course_id)
+
+            # Get Q-value from trained model
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.agent.device)
+                q_values = self.agent.q_network(state_tensor)
+
+                # Find the action index for this course
+                try:
+                    course_idx = available_courses.index(course_id) % self.agent.action_dim
+                    score = q_values[0][course_idx].item()
+                except:
+                    score = q_values[0].max().item()  # Fallback
+
+            course_scores.append((course_id, score))
+
+        # Sort by score and return top-k
+        course_scores.sort(key=lambda x: x[1], reverse=True)
+        recommended_course_ids = [cid for cid, _ in course_scores[:top_k]]
+
+        # Get detailed course information
+        recommendations = []
+        for course_id in recommended_course_ids:
+            course_info = self.course_data[self.course_data['course_id'] == course_id].iloc[0]
+            score = next(score for cid, score in course_scores if cid == course_id)
+
+            recommendations.append({
+                'course_id': course_id,
+                'course_name': course_info['course_name'],
+                'category': course_info['category'],
+                'difficulty': course_info['difficulty'],
+                'duration_hours': course_info['duration_hours'],
+                'rating': round(course_info['rating'], 2),
+                'num_lessons': course_info['num_lessons'],
+                'ai_score': round(score, 4)
+            })
+
+        return recommendations
+
+    def get_user_info(self, user_id):
+        """Get user information by user_id"""
+        user_match = self.user_data[self.user_data['user_id'] == user_id]
+        if user_match.empty:
+            return None
+        return user_match.iloc[0].to_dict()
+
+    def get_all_users(self):
+        """Get all available users"""
+        return self.user_data['user_id'].tolist()
 
 
-def load_or_train_model():
-    """Load model từ file, nếu không có thì train mới"""
-    global model
-
-    # Thử load model đã lưu trước
-    model = load_saved_model()
-
-    if model is None:
-        print("Không có model đã lưu, bắt đầu train model mới...")
-        model = train_and_save_model()
-
-    return model
+# ===============================
+# GLOBAL VARIABLES
+# ===============================
+rec_system = None
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Load hoặc train model khi start server"""
+# ===============================
+# FASTAPI LIFECYCLE
+# ===============================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global rec_system
+    print("🚀 Starting FastAPI Course Recommendation Service...")
     try:
-        load_or_train_model()
-        print("✓ Model sẵn sàng để dự đoán!")
+        rec_system = EnglishLearningRecommendationSystem()
+        print("✅ Recommendation system initialized!")
     except Exception as e:
-        print(f"✗ Lỗi khi load/train model: {e}")
-        print("Server sẽ không thể dự đoán cho đến khi model được load thành công")
+        print(f"❌ Failed to initialize recommendation system: {e}")
+        raise
 
+    yield
+
+    # Shutdown
+    print("🔽 Shutting down recommendation service...")
+
+
+# ===============================
+# FASTAPI APPLICATION
+# ===============================
+
+app = FastAPI(
+    title="English Learning Course Recommendation API",
+    description="AI-powered course recommendation system for English learning",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+
+# ===============================
+# API ENDPOINTS
+# ===============================
 
 @app.get("/")
 async def root():
+    """Root endpoint"""
     return {
-        "message": "Student Dropout Risk Prediction API",
-        "status": "ready",
+        "message": "English Learning Course Recommendation API",
+        "version": "1.0.0",
+        "status": "running",
         "endpoints": {
-            "predict": "/predict - Dự đoán nguy cơ bỏ học",
-            "predict-simple": "/predict-simple - API đơn giản",
-            "retrain": "/retrain - Train lại model từ CSV",
-            "model-info": "/model-info - Thông tin model",
-            "health": "/health - Kiểm tra trạng thái",
-            "docs": "/docs - Tài liệu API"
+            "recommendations": "/recommendations/{user_id}",
+            "users": "/users",
+            "health": "/health"
         }
     }
 
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint"""
+    global rec_system
     return {
-        "status": "healthy",
-        "model_loaded": model is not None,
-        "model_file_exists": os.path.exists(MODEL_FILE),
-        "training_data_exists": os.path.exists(TRAINING_DATA_FILE),
-        "ready_for_predictions": model is not None
+        "status": "healthy" if rec_system is not None else "unhealthy",
+        "model_loaded": rec_system is not None,
+        "total_courses": len(rec_system.course_data) if rec_system else 0,
+        "total_users": len(rec_system.user_data) if rec_system else 0
     }
 
 
-@app.get("/model-info")
-async def get_model_info():
-    """Lấy thông tin về model hiện tại"""
-    info = {
-        "model_loaded": model is not None,
-        "model_file_exists": os.path.exists(MODEL_FILE),
-        "training_data_exists": os.path.exists(TRAINING_DATA_FILE)
+@app.get("/users")
+async def get_all_users():
+    """Get all available users"""
+    global rec_system
+    if rec_system is None:
+        raise HTTPException(status_code=503, detail="Recommendation system not initialized")
+
+    users = rec_system.get_all_users()
+    return {
+        "total_users": len(users),
+        "users": users
     }
 
-    # Thêm metadata nếu có
-    if os.path.exists('model_metadata.json'):
-        import json
+
+@app.get("/recommendations/{user_id}", response_model=RecommendationResponse)
+async def get_recommendations(
+        user_id: str,
+        top_k: int = Query(default=5, ge=1, le=20, description="Number of recommendations to return"),
+        exclude_courses: Optional[str] = Query(default=None,
+                                               description="Comma-separated list of course IDs to exclude")
+):
+    """Get course recommendations for a specific user"""
+    global rec_system
+
+    if rec_system is None:
+        raise HTTPException(status_code=503, detail="Recommendation system not initialized")
+
+    # Get user info
+    user_info = rec_system.get_user_info(user_id)
+    if user_info is None:
+        available_users = rec_system.get_all_users()
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"User '{user_id}' not found",
+                "available_users": available_users[:10],  # Show first 10 users
+                "total_available_users": len(available_users)
+            }
+        )
+
+    # Parse exclude_courses
+    exclude_list = []
+    if exclude_courses:
         try:
-            with open('model_metadata.json', 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
-            info["metadata"] = metadata
-        except:
-            pass
+            exclude_list = [int(cid.strip()) for cid in exclude_courses.split(',') if cid.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid exclude_courses format. Use comma-separated integers.")
 
-    return info
-
-
-@app.post("/retrain")
-async def retrain_model():
-    """Train lại model từ CSV và lưu vào file"""
-    global model
-
+    # Get recommendations
     try:
-        model = train_and_save_model()
+        recommendations = rec_system.recommend_courses(user_info, top_k=top_k, exclude_courses=exclude_list)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating recommendations: {str(e)}")
+
+    # Create user profile
+    user_profile = UserProfile(
+        user_id=user_id,
+        age=user_info.get('age'),
+        current_level=user_info.get('current_level'),
+        learning_goal=user_info.get('learning_goal'),
+        study_time_per_week=user_info.get('study_time_per_week'),
+        preferred_skill=user_info.get('preferred_skill'),
+        country=user_info.get('country')
+    )
+
+    # Convert recommendations to response format
+    course_recommendations = [
+        CourseRecommendation(**rec) for rec in recommendations
+    ]
+
+    return RecommendationResponse(
+        user_id=user_id,
+        user_profile=user_profile,
+        recommendations=course_recommendations,
+        total_courses=len(course_recommendations)
+    )
+
+
+@app.get("/recommendations/{user_id}/simple")
+async def get_simple_recommendations(
+        user_id: str,
+        top_k: int = Query(default=5, ge=1, le=20, description="Number of recommendations to return")
+):
+    """Get simple course recommendations (course IDs only)"""
+    global rec_system
+
+    if rec_system is None:
+        raise HTTPException(status_code=503, detail="Recommendation system not initialized")
+
+    # Get user info
+    user_info = rec_system.get_user_info(user_id)
+    if user_info is None:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+
+    # Get recommendations
+    try:
+        recommendations = rec_system.recommend_courses(user_info, top_k=top_k)
+        course_ids = [rec['course_id'] for rec in recommendations]
+
         return {
-            "message": "Model đã được train lại thành công",
-            "status": "success",
-            "model_file": MODEL_FILE
+            "user_id": user_id,
+            "recommended_course_ids": course_ids,
+            "total_recommendations": len(course_ids)
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi train model: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating recommendations: {str(e)}")
 
 
-# OPTIONS handler cho preflight requests
-@app.options("/predict-simple")
-async def options_predict_simple():
-    return {"message": "OK"}
-
-
-@app.post("/predict", response_model=PredictionResponse)
-async def predict_dropout_risk(request: PredictionRequest):
-    """Dự đoán nguy cơ bỏ học cho danh sách sinh viên"""
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model chưa được load")
-
-    if not request.students:
-        raise HTTPException(status_code=400, detail="Danh sách sinh viên không được rỗng")
-
-    try:
-        # Chuẩn bị dữ liệu cho ML model
-        X = np.array([[s.days_since_enrollment, s.passedLesson, s.passedTests, s.progress]
-                      for s in request.students])
-
-        # Dự đoán
-        predictions = model.predict(X)
-        probabilities = model.predict_proba(X)[:, 1]
-
-        # Tạo kết quả
-        results = []
-        for i, (student, pred, prob) in enumerate(zip(request.students, predictions, probabilities)):
-            risk_status = "NGUY CƠ BỎ HỌC" if pred == 1 else "AN TOÀN"
-
-            result = StudentWithRisk(
-                email=student.email,
-                name=student.name,
-                days_since_enrollment=student.days_since_enrollment,
-                passedLesson=student.passedLesson,
-                passedTests=student.passedTests,
-                progress=student.progress,
-                lastLogin=student.lastLogin,
-                risk=int(pred),
-                risk_status=risk_status
-            )
-            results.append(result)
-
-        # Tạo summary
-        total_students = len(results)
-        high_risk_count = sum(1 for r in results if r.risk == 1)
-        safe_count = total_students - high_risk_count
-
-        summary = {
-            "total_students": total_students,
-            "high_risk_students": high_risk_count,
-            "safe_students": safe_count,
-            "high_risk_percentage": round((high_risk_count / total_students) * 100, 1) if total_students > 0 else 0
-        }
-
-        return PredictionResponse(predictions=results, summary=summary)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi dự đoán: {str(e)}")
-
-
-@app.post("/predict-simple")
-async def predict_simple(students: List[List[float]]):
-    """API đơn giản - Input: [[days, lessons, tests, progress], ...]"""
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model chưa được load")
-
-    if not students:
-        raise HTTPException(status_code=400, detail="Danh sách sinh viên không được rỗng")
-
-    try:
-        X = np.array(students)
-        predictions = model.predict(X)
-
-        results = []
-        for i, (student, pred) in enumerate(zip(students, predictions)):
-            result = student + [int(pred)]
-            results.append(result)
-
-        return {"predictions": results}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi: {str(e)}")
-
+# ===============================
+# MAIN FUNCTION
+# ===============================
 
 if __name__ == "__main__":
+    print("🌟 Starting English Learning Course Recommendation API...")
     uvicorn.run(
-        "main:app",
+        "main:app",  # Change this to your actual filename if different
         host="0.0.0.0",
         port=8000,
         reload=True,
