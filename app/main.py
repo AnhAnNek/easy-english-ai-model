@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # Thêm import này
 from pydantic import BaseModel
 from typing import List, Optional
 import numpy as np
@@ -188,45 +189,44 @@ class EnglishLearningRecommendationSystem:
             return None
 
     def process_courses_data(self, api_courses):
-        """Process API course data"""
+        """Process API course data - use real data except for category"""
         course_categories = ['Grammar', 'Vocabulary', 'Speaking', 'Listening', 'Reading', 'Writing', 'TOEIC', 'IELTS']
-        difficulty_levels = ['Beginner', 'Elementary', 'Intermediate', 'Upper-Intermediate', 'Advanced']
 
         courses = []
         for course in api_courses:
             course_info = {
                 'course_id': course['course_id'],
-                'course_name': f"Course_{course['course_id']}",
-                'category': np.random.choice(course_categories),
-                'difficulty': np.random.choice(difficulty_levels),
-                'duration_hours': np.random.randint(5, 50),
-                'rating': np.random.uniform(3.0, 5.0),
-                'num_lessons': np.random.randint(10, 100),
-                'prerequisite_level': np.random.randint(0, 5)
+                'course_name': course.get('course_name', f"Course_{course['course_id']}"),
+                'category': np.random.choice(course_categories),  # Only randomize category
+                'difficulty': course.get('difficulty', 'Intermediate'),  # Use API data
+                'duration_hours': course.get('duration_hours', 20),  # Use API data
+                'rating': course.get('rating', 4.0),  # Use API data
+                'num_lessons': course.get('num_lessons', 30),  # Use API data
+                'prerequisite_level': course.get('prerequisite_level', 2)  # Use API data
             }
             courses.append(course_info)
 
         return pd.DataFrame(courses)
 
     def process_users_data(self, api_users):
-        """Process API user data"""
+        """Process API user data - use real data except for category preferences"""
         course_categories = ['Grammar', 'Vocabulary', 'Speaking', 'Listening', 'Reading', 'Writing', 'TOEIC', 'IELTS']
 
         users = []
         for user in api_users:
             user_info = {
                 'user_id': user['username'],
-                'age': np.random.randint(15, 60),
-                'current_level': np.random.randint(0, 5),
-                'learning_goal': np.random.choice(['Business', 'Academic', 'Travel', 'General', 'Test_Prep']),
-                'study_time_per_week': np.random.randint(2, 20),
-                'preferred_skill': np.random.choice(course_categories),
-                'country': np.random.choice(['Vietnam', 'Korea', 'Japan', 'China', 'Thailand', 'Other'])
+                'age': user.get('age', 25),  # Use API data
+                'current_level': user.get('current_level', 2),  # Use API data
+                'learning_goal': user.get('learning_goal', 'General'),  # Use API data
+                'study_time_per_week': user.get('study_time_per_week', 10),  # Use API data
+                'preferred_skill': user.get('preferred_skill', np.random.choice(course_categories)),
+                # Use API data, fallback to random
+                'country': user.get('country', 'Vietnam')  # Use API data
             }
             users.append(user_info)
 
         return pd.DataFrame(users)
-
     def create_sample_data(self):
         """Create sample data when API is unavailable"""
         # Sample courses
@@ -466,6 +466,34 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# ===============================
+# CORS CONFIGURATION
+# ===============================
+
+# Thêm CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",      # React development server
+        "http://127.0.0.1:3000",     # Alternative localhost
+        "http://localhost:3001",      # Alternative port
+        "http://localhost:8080",      # Alternative port
+        # Thêm các domain khác nếu cần
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],  # Cho phép tất cả HTTP methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Cho phép tất cả headers
+)
+
+# Hoặc để cho phép tất cả origins (chỉ dùng trong development):
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
 
 # ===============================
 # API ENDPOINTS
@@ -478,6 +506,8 @@ async def root():
         "message": "English Learning Course Recommendation API",
         "version": "1.0.0",
         "status": "running",
+        "cors_enabled": True,
+        "allowed_origins": ["localhost:3000"],
         "endpoints": {
             "recommendations": "/recommendations/{user_id}",
             "users": "/users",
@@ -494,7 +524,8 @@ async def health_check():
         "status": "healthy" if rec_system is not None else "unhealthy",
         "model_loaded": rec_system is not None,
         "total_courses": len(rec_system.course_data) if rec_system else 0,
-        "total_users": len(rec_system.user_data) if rec_system else 0
+        "total_users": len(rec_system.user_data) if rec_system else 0,
+        "cors_enabled": True
     }
 
 
@@ -612,6 +643,7 @@ async def get_simple_recommendations(
 
 if __name__ == "__main__":
     print("🌟 Starting English Learning Course Recommendation API...")
+    print("✅ CORS enabled for localhost:3000")
     uvicorn.run(
         "main:app",  # Change this to your actual filename if different
         host="0.0.0.0",
